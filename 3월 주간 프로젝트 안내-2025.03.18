@@ -1,0 +1,358 @@
+#include <Arduino.h>
+#include <Arduino_FreeRTOS.h>
+#include <semphr.h>
+#include <NewPing.h>  
+
+#define IN1 11 
+#define IN2 10  
+#define ENL 7
+#define IN3 9
+#define IN4 8
+#define ENR 6
+
+#define SONIC_TRIG_LEFT 34
+#define SONIC_ECHO_LEFT 35
+#define SONIC_TRIG_CENTER 51
+#define SONIC_ECHO_CENTER 50
+#define SONIC_TRIG_RIGHT 46
+#define SONIC_ECHO_RIGHT 47
+
+#define MAX_DISTANCE 200 
+#define LINE_DETECT_WHITE 1
+#define motor_speed_offset 25
+#define LINE_SENSOR_COUNT 5
+
+#define DEBUG_PIN_SONAR 26   
+#define DEBUG_PIN_LINE 27  
+#define DEBUG_PIN_MOTOR 28  
+
+NewPing sonarLeft(SONIC_TRIG_LEFT, SONIC_ECHO_LEFT, MAX_DISTANCE);
+NewPing sonarCenter(SONIC_TRIG_CENTER, SONIC_ECHO_CENTER, MAX_DISTANCE);
+NewPing sonarRight(SONIC_TRIG_RIGHT, SONIC_ECHO_RIGHT, MAX_DISTANCE);
+
+int linesensor_pin[LINE_SENSOR_COUNT] = {32, 33, 31, 30, 29};
+volatile int linesensor_data[LINE_SENSOR_COUNT] = {0, 0, 0, 0, 0};
+volatile int line_type = 0;
+
+TaskHandle_t control_motor_handle;
+TaskHandle_t read_sonar_handle;
+TaskHandle_t read_line_sensor_handle;
+
+SemaphoreHandle_t xDistanceMutex;
+SemaphoreHandle_t xLineSensorMutex;
+
+volatile unsigned long distance_left = 0;
+volatile unsigned long distance_center = 0;
+volatile unsigned long distance_right = 0;
+
+void motor_l(int speed);
+void motor_r(int speed);
+void robot_control(int left_motor_speed, int right_motor_speed);
+void control_motor(void *pvParameters);
+void read_sonar_sensor(void *pvParameters);
+void read_line_sensor(void *pvParameters);
+int read_digital_line_sensor(void);
+void line_following(int line_type);
+
+void setup() 
+{
+    Serial.begin(9600);
+    
+    pinMode(IN1, OUTPUT);
+    pinMode(IN2, OUTPUT);
+    pinMode(IN3, OUTPUT);
+    pinMode(IN4, OUTPUT);
+    pinMode(ENL, OUTPUT);
+    pinMode(ENR, OUTPUT);
+    
+    pinMode(DEBUG_PIN_SONAR, OUTPUT);
+    pinMode(DEBUG_PIN_LINE, OUTPUT);
+    pinMode(DEBUG_PIN_MOTOR, OUTPUT);
+    
+    digitalWrite(DEBUG_PIN_SONAR, LOW);
+    digitalWrite(DEBUG_PIN_LINE, LOW);
+    digitalWrite(DEBUG_PIN_MOTOR, LOW);
+    
+    for (int i = 0; i < LINE_SENSOR_COUNT; i++) 
+    {
+        pinMode(linesensor_pin[i], INPUT);
+    }
+    
+    xDistanceMutex = xSemaphoreCreateMutex();
+    xLineSensorMutex = xSemaphoreCreateMutex();
+    
+    xTaskCreate(
+        read_sonar_sensor,
+        "ReadSonar",
+        128,
+        NULL,
+        1,
+        &read_sonar_handle
+    );
+    
+    xTaskCreate(
+        read_line_sensor,
+        "ReadLine",
+        128,
+        NULL,
+        1,
+        &read_line_sensor_handle
+    );
+    
+    xTaskCreate(
+        control_motor,
+        "ControlMotor",
+        128,
+        NULL,
+        1,
+        &control_motor_handle
+    );
+    
+    vTaskStartScheduler();
+}
+
+void loop() 
+{
+}
+
+int read_digital_line_sensor(void) 
+{
+    int i;
+    int sum = 0;
+    for (i = 0; i < LINE_SENSOR_COUNT; i++) 
+    {
+        if (LINE_DETECT_WHITE == 0) 
+        {
+            linesensor_data[i] = 1 - digitalRead(linesensor_pin[i]);
+        } 
+        else 
+        {
+            linesensor_data[i] = digitalRead(linesensor_pin[i]);
+        }
+        sum += linesensor_data[i];
+    }
+    
+    if (sum == 5) 
+    {
+        return sum;
+    } 
+    else if (sum == 2) 
+    {
+        if ((linesensor_data[3] == 1) && (linesensor_data[4] == 1)) return 3;
+        if ((linesensor_data[2] == 1) && (linesensor_data[3] == 1)) return 1;
+        if ((linesensor_data[1] == 1) && (linesensor_data[2] == 1)) return -1;
+        if ((linesensor_data[0] == 1) && (linesensor_data[1] == 1)) return -3;
+    } 
+    else if (sum == 1) 
+    {
+        if (linesensor_data[0] == 1) return -4;
+        if (linesensor_data[1] == 1) return -2;
+        if (linesensor_data[2] == 1) return 0;
+        if (linesensor_data[3] == 1) return 2;
+        if (linesensor_data[4] == 1) return 4;
+    } 
+    else if (sum == 3) 
+    {
+        return -10;
+    } 
+    else 
+    {
+        return -5;
+    }
+}
+
+void line_following(int line_type) 
+{
+    switch (line_type) 
+    {
+        case -4:
+            motor_l(-80);
+            motor_r(200);
+            break;
+        case -3:
+            motor_l(-40);
+            motor_r(180);
+            break;
+        case -2:
+            motor_l(-10);
+            motor_r(160);
+            break;
+        case -1:
+            motor_l(-20);
+            motor_r(140);
+            break;
+        case 0:
+            motor_l(80);
+            motor_r(80);
+            break;
+        case 1:
+            motor_l(140);
+            motor_r(20);
+            break;
+        case 2:
+            motor_l(160);
+            motor_r(10);
+            break;
+        case 3:
+            motor_l(180);
+            motor_r(40);
+            break;
+        case 4:
+            motor_l(200);
+            motor_r(80);
+            break;
+        case 5:
+            motor_l(0);
+            motor_r(0);
+            break;
+    }
+}
+
+void read_line_sensor(void *pvParameters) 
+{
+    Serial.println("Line Sensor Task Started");
+    
+    for (;;) 
+    {
+        digitalWrite(DEBUG_PIN_LINE, HIGH); 
+        
+        int current_line_type = read_digital_line_sensor();
+        
+        if (xSemaphoreTake(xLineSensorMutex, portMAX_DELAY) == pdTRUE) 
+        {
+            line_type = current_line_type;
+            xSemaphoreGive(xLineSensorMutex);
+        }
+
+        digitalWrite(DEBUG_PIN_LINE, LOW); 
+        
+       // Serial.print("Line sensor data = ");
+        /*for (int i = 0; i < LINE_SENSOR_COUNT; i++) 
+        {
+            Serial.print(linesensor_data[i]);
+            Serial.print(" ");
+        }
+        Serial.print("Line type: ");
+        Serial.println(current_line_type);
+*/
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+
+void read_sonar_sensor(void *pvParameters) 
+{
+    Serial.println("Sonar Sensor Task Started");
+    
+    for (;;) 
+    {
+        digitalWrite(DEBUG_PIN_SONAR, HIGH);
+        
+        unsigned long left = sonarLeft.ping_cm();
+        unsigned long center = sonarCenter.ping_cm();
+        unsigned long right = sonarRight.ping_cm();
+        
+        if (left == 0) left = MAX_DISTANCE;
+        if (center == 0) center = MAX_DISTANCE;
+        if (right == 0) right = MAX_DISTANCE;
+        
+        if (xSemaphoreTake(xDistanceMutex, portMAX_DELAY) == pdTRUE) 
+        {
+            distance_left = left;
+            distance_center = center;
+            distance_right = right;
+            xSemaphoreGive(xDistanceMutex);
+        }
+        
+        Serial.print("\n[SONAR] Left: ");
+        Serial.print(left);
+        Serial.print(" cm | Center: ");
+        Serial.print(center);
+        Serial.print(" cm | Right: ");
+        Serial.print(right);
+        Serial.println(" cm");
+        
+        digitalWrite(DEBUG_PIN_SONAR, LOW);
+        
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+void motor_l(int speed) 
+{
+    if (speed >= 0) 
+    {
+        digitalWrite(IN1, LOW);
+        digitalWrite(IN2, HIGH);
+        analogWrite(ENL, speed);
+    }
+    else 
+    {
+        digitalWrite(IN1, HIGH);
+        digitalWrite(IN2, LOW);
+        analogWrite(ENL, -speed);
+    }
+}
+
+void motor_r(int speed) 
+{
+    if (speed >= 0) 
+    {
+        digitalWrite(IN3, LOW);
+        digitalWrite(IN4, HIGH);
+        analogWrite(ENR, speed);
+    } 
+    else 
+    {
+        digitalWrite(IN3, HIGH);
+        digitalWrite(IN4, LOW);
+        analogWrite(ENR, -speed);
+    }
+}
+
+void robot_control(int left_motor_speed, int right_motor_speed) 
+{
+    motor_l(left_motor_speed);
+    motor_r(right_motor_speed);
+}
+
+void control_motor(void *pvParameters) 
+{
+    Serial.println("Motor Control Task Started");
+    
+    for (;;) 
+    {
+        digitalWrite(DEBUG_PIN_MOTOR, HIGH);
+        
+        unsigned long left = 0, center = 0, right = 0;
+        int current_line_type = 0;
+        
+        if (xSemaphoreTake(xLineSensorMutex, portMAX_DELAY) == pdTRUE) 
+        {
+            current_line_type = line_type;
+            xSemaphoreGive(xLineSensorMutex);
+        }
+        
+        if (xSemaphoreTake(xDistanceMutex, portMAX_DELAY) == pdTRUE) 
+        {
+            left = distance_left;
+            center = distance_center;
+            right = distance_right;
+            xSemaphoreGive(xDistanceMutex);
+        }
+        
+        if (center < 15) 
+        {
+            robot_control(0, 0);
+            Serial.println("Obstacle detected! Stopping...");
+        } 
+        else 
+        {
+            line_following(current_line_type);
+        }
+        
+        digitalWrite(DEBUG_PIN_MOTOR, LOW);
+        
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
